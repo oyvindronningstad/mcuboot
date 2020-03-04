@@ -33,7 +33,6 @@
 #include <drivers/flash.h>
 #include <sys/crc.h>
 #include <sys/base64.h>
-#include <cbor.h>
 #else
 #include <bsp/bsp.h>
 #include <hal/hal_system.h>
@@ -41,7 +40,6 @@
 #include <os/os_cputime.h>
 #include <crc/crc16.h>
 #include <base64/base64.h>
-#include <tinycbor/cbor.h>
 #endif /* __ZEPHYR__ */
 
 #include <flash_map_backend/flash_map_backend.h>
@@ -58,7 +56,8 @@
 #include "bootutil_priv.h"
 #endif
 
-#include "serial_recovery_cbor.h"
+#include "serial_recovery_cbor_decode.h"
+#include "serial_recovery_cbor_encode.h"
 
 MCUBOOT_LOG_MODULE_DECLARE(mcuboot);
 
@@ -94,29 +93,9 @@ static uint32_t img_size;
 static struct nmgr_hdr *bs_hdr;
 
 static char bs_obuf[BOOT_SERIAL_OUT_MAX];
+static size_t bs_olen;
 
-static int bs_cbor_writer(struct cbor_encoder_writer *, const char *data,
-  int len);
 static void boot_serial_output(void);
-
-static struct cbor_encoder_writer bs_writer = {
-    .write = bs_cbor_writer
-};
-static CborEncoder bs_root;
-static CborEncoder bs_rsp;
-
-int
-bs_cbor_writer(struct cbor_encoder_writer *cew, const char *data, int len)
-{
-    if (cew->bytes_written + len > sizeof(bs_obuf)) {
-        return CborErrorOutOfMemory;
-    }
-
-    memcpy(&bs_obuf[cew->bytes_written], data, len);
-    cew->bytes_written += len;
-
-    return 0;
-}
 
 /*
  * Convert version into string without use of snprintf().
@@ -170,17 +149,16 @@ bs_list_img_ver(char *dst, int maxlen, struct image_version *ver)
 static void
 bs_list(char *buf, int len)
 {
-    CborEncoder images;
-    CborEncoder image;
     struct image_header hdr;
     uint8_t tmpbuf[64];
     int slot, area_id;
     const struct flash_area *fap;
     uint8_t image_index;
+    Response_t message = {
+        ._Response_union_choice = _Response_union_images,
+        ._Response_union_images_map_count = BOOT_IMAGE_NUMBER,
+    };
 
-    cbor_encoder_create_map(&bs_root, &bs_rsp, CborIndefiniteLength);
-    cbor_encode_text_stringz(&bs_rsp, "images");
-    cbor_encoder_create_array(&bs_rsp, &images, CborIndefiniteLength);
     image_index = 0;
     IMAGES_ITER(image_index) {
         for (slot = 0; slot < 2; slot++) {
@@ -199,25 +177,21 @@ bs_list(char *buf, int len)
             }
             flash_area_close(fap);
 
-            cbor_encoder_create_map(&images, &image, CborIndefiniteLength);
-
-#if (BOOT_IMAGE_NUMBER > 1)
-            cbor_encode_text_stringz(&image, "image");
-            cbor_encode_int(&image, image_index);
-#endif
-
-            cbor_encode_text_stringz(&image, "slot");
-            cbor_encode_int(&image, slot);
-            cbor_encode_text_stringz(&image, "version");
-
+            if (BOOT_IMAGE_NUMBER > 1) {
+                message._Response_union_images_map[slot]._Response_union_images_map_image_present = true;
+                message._Response_union_images_map[slot]._Response_union_images_map_image.
+                                _Response_union_images_map_image = image_index;
+            }
+            message._Response_union_images_map[slot]._Response_union_images_map_slot = slot;
             bs_list_img_ver((char *)tmpbuf, sizeof(tmpbuf), &hdr.ih_ver);
-            cbor_encode_text_stringz(&image, (char *)tmpbuf);
-            cbor_encoder_close_container(&images, &image);
+            message._Response_union_images_map[slot]._Response_union_images_map_version.value = tmpbuf;
+            message._Response_union_images_map[slot]._Response_union_images_map_version.len = strlen(tmpbuf);
         }
     }
-    cbor_encoder_close_container(&bs_rsp, &images);
-    cbor_encoder_close_container(&bs_root, &bs_rsp);
-    boot_serial_output();
+    bool res = cbor_encode_Response(bs_obuf, sizeof(bs_obuf), &message, &bs_olen);
+    if (res) {
+        boot_serial_output();
+    }
 }
 
 /*
@@ -367,16 +341,17 @@ bs_upload(char *buf, int len)
 
 out:
     BOOT_LOG_INF("RX: 0x%x", rc);
-    cbor_encoder_create_map(&bs_root, &bs_rsp, CborIndefiniteLength);
-    cbor_encode_text_stringz(&bs_rsp, "rc");
-    cbor_encode_int(&bs_rsp, rc);
-    if (rc == 0) {
-        cbor_encode_text_stringz(&bs_rsp, "off");
-        cbor_encode_uint(&bs_rsp, curr_off);
-    }
-    cbor_encoder_close_container(&bs_root, &bs_rsp);
 
-    boot_serial_output();
+    Response_t response = {
+        ._Response_union_choice = _Response_union__rc,
+        ._Response_union__rc_rc = rc,
+        ._Response_union__rc_off = {._Response_union__rc_off = curr_off},
+        ._Response_union__rc_off_present = (rc == 0),
+    };
+    bool res = cbor_encode_Response(bs_obuf, sizeof(bs_obuf), &response, &bs_olen);
+    if (res) {
+        boot_serial_output();
+    }
     flash_area_close(fap);
 }
 
@@ -386,11 +361,11 @@ out:
 static void
 bs_empty_rsp(char *buf, int len)
 {
-    cbor_encoder_create_map(&bs_root, &bs_rsp, CborIndefiniteLength);
-    cbor_encode_text_stringz(&bs_rsp, "rc");
-    cbor_encode_int(&bs_rsp, 0);
-    cbor_encoder_close_container(&bs_root, &bs_rsp);
-    boot_serial_output();
+    Response_t response = {0};
+    bool res = cbor_encode_Response(bs_obuf, sizeof(bs_obuf), &response, &bs_olen);
+    if (res) {
+        boot_serial_output();
+    }
 }
 
 /*
@@ -431,13 +406,6 @@ boot_serial_input(char *buf, int len)
 
     buf += sizeof(*hdr);
     len -= sizeof(*hdr);
-
-    bs_writer.bytes_written = 0;
-#ifdef __ZEPHYR__
-    cbor_encoder_cust_writer_init(&bs_root, &bs_writer, 0);
-#else
-    cbor_encoder_init(&bs_root, &bs_writer, 0);
-#endif
 
     /*
      * Limited support for commands.
@@ -480,7 +448,7 @@ boot_serial_output(void)
     char encoded_buf[BASE64_ENCODE_SIZE(BOOT_SERIAL_OUT_MAX)];
 
     data = bs_obuf;
-    len = bs_writer.bytes_written;
+    len = bs_olen;
 
     bs_hdr->nh_op++;
     bs_hdr->nh_flags = 0;

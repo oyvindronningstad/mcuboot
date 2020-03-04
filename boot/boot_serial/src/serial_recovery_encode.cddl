@@ -1,0 +1,17 @@
+;
+; Copyright (c) 2020 Nordic Semiconductor ASA
+;
+; SPDX-License-Identifier: Apache-2.0
+;
+
+Response = {
+	"images" => [+{
+		?"image" => uint,
+		"slot" => uint,
+		"version" => bstr,
+	}] //
+	(
+		"rc" => int,
+		?"off" => uint
+	)
+}
