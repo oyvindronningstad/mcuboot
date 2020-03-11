@@ -1,6 +1,6 @@
 /*
  * This file has been copied from the cddl_gen submodule.
- * Commit 9d911cf0c7c9f13b5a9fdd5ed6c1012df21e5576
+ * Commit 5c4976150399c648ef090b5fd1c2384e42a73530
  */
 
 /*
@@ -14,22 +14,8 @@
 #include <stddef.h>
 #include <string.h>
 #include "cbor_decode.h"
+#include "cbor_common.h"
 
-/** Enumeration representing the major types available in CBOR.
- *
- * The major type is represented in the 3 first bits of the header byte.
- */
-typedef enum
-{
-	CBOR_MAJOR_TYPE_PINT = 0, ///! Positive Integer
-	CBOR_MAJOR_TYPE_NINT = 1, ///! Negative Integer
-	CBOR_MAJOR_TYPE_BSTR = 2, ///! Byte String
-	CBOR_MAJOR_TYPE_TSTR = 3, ///! Text String
-	CBOR_MAJOR_TYPE_LIST = 4, ///! List
-	CBOR_MAJOR_TYPE_MAP  = 5, ///! Map
-	CBOR_MAJOR_TYPE_TAG  = 6, ///! Semantic Tag
-	CBOR_MAJOR_TYPE_PRIM = 7, ///! Primitive Type
-} cbor_major_type_t;
 
 /** Return value length from additional value.
  */
@@ -52,17 +38,6 @@ static uint32_t additional_len(uint8_t additional)
 /** Extract the additional info, i.e. the last 5 bits of the header byte. */
 #define ADDITIONAL(header_byte) ((header_byte) & 0x1F)
 
-/** Shorthand macro to check if a result is within min/max constraints.
- */
-#define PTR_VALUE_IN_RANGE(type, p_res, p_min, p_max) \
-		(((p_min == NULL) || (*(type *)p_res >= *(type *)p_min)) \
-		&& ((p_max == NULL) || (*(type *)p_res <= *(type *)p_max)))
-
-#define FAIL() \
-do {\
-	cbor_decode_trace(); \
-	return false; \
-} while(0)
 
 #define FAIL_AND_DECR_IF(expr) \
 do {\
@@ -71,11 +46,6 @@ do {\
 		FAIL(); \
 	} \
 } while(0)
-
-#define VALUE_IN_HEADER 23 /**! For values below this, the value is encoded
-                                directly in the header. */
-
-#define BOOL_TO_PRIM 20 ///! In CBOR, false/true have the values 20/21
 
 /** Get a single value.
  *
@@ -95,11 +65,12 @@ do {\
  *          CBOR values are always big-endian, so this function converts from
  *          big to little-endian if necessary (@ref CONFIG_BIG_ENDIAN).
  */
-static bool value_extract(cbor_decode_state_t * p_state,
+static bool value_extract(cbor_state_t * p_state,
 		void * const p_result, size_t result_len)
 {
-	cbor_decode_trace();
-	cbor_decode_assert(result_len != 0, "0-length result not supported.\n");
+	cbor_trace();
+	cbor_assert(result_len != 0, "0-length result not supported.\n");
+	cbor_assert(p_result != NULL, NULL);
 
 	FAIL_AND_DECR_IF(p_state->elem_count == 0);
 	FAIL_AND_DECR_IF(p_state->p_payload >= p_state->p_payload_end);
@@ -139,33 +110,36 @@ static bool value_extract(cbor_decode_state_t * p_state,
 }
 
 
-static bool int32_decode(cbor_decode_state_t * p_state,
-		int32_t *p_result, void *p_min_value, void *p_max_value)
+static bool int32_decode(cbor_state_t * p_state, int32_t *p_result)
 {
 	uint8_t major_type = MAJOR_TYPE(*p_state->p_payload);
+	uint32_t uint_result;
+	int32_t int_result;
 
-	if (!value_extract(p_state, p_result, 4)) {
+	if (!value_extract(p_state, &uint_result, 4)) {
 		FAIL();
 	}
-	if (*p_result < 0) {
+
+	cbor_print("uintval: %u\r\n", uint_result);
+	if (uint_result >= (1 << (8*sizeof(uint_result)-1))) {
 		/* Value is too large to fit in a signed integer. */
 		FAIL();
 	}
 
 	if (major_type == CBOR_MAJOR_TYPE_NINT) {
 		// Convert from CBOR's representation.
-		*p_result = 1 - *p_result;
+		int_result = -1 - uint_result;
+	} else {
+		int_result = uint_result;
 	}
-	if (!PTR_VALUE_IN_RANGE(int32_t, p_result, p_min_value, p_max_value)) {
-		FAIL();
-	}
-	cbor_decode_print("val: %d\r\n", *p_result);
+
+	cbor_print("val: %d\r\n", int_result);
+	*p_result = int_result;
 	return true;
 }
 
 
-bool intx32_decode(cbor_decode_state_t * p_state,
-		int32_t *p_result, void *p_min_value, void *p_max_value)
+bool intx32_decode(cbor_state_t * p_state, int32_t *p_result)
 {
 	uint8_t major_type = MAJOR_TYPE(*p_state->p_payload);
 
@@ -175,32 +149,37 @@ bool intx32_decode(cbor_decode_state_t * p_state,
 		FAIL();
 	}
 
-	if (!int32_decode(p_state,
-				p_result, p_min_value,
-				p_max_value)){
+	if (!int32_decode(p_state, p_result)){
+		FAIL();
+	}
+	return true;
+}
+
+bool intx32_expect(cbor_state_t * p_state, int32_t *p_result)
+{
+	int32_t value;
+	if (!intx32_decode(p_state, &value)) {
+		FAIL();
+	}
+	if (value != *p_result) {
+		cbor_print("%d != %d\r\n", value, *p_result);
 		FAIL();
 	}
 	return true;
 }
 
 
-static bool uint32_decode(cbor_decode_state_t * p_state,
-		void *p_result, void *p_min_value, void *p_max_value)
+static bool uint32_decode(cbor_state_t * p_state, uint32_t *p_result)
 {
 	if (!value_extract(p_state, p_result, 4)) {
 		FAIL();
 	}
 
-	if (!PTR_VALUE_IN_RANGE(uint32_t, p_result, p_min_value, p_max_value)) {
-		FAIL();
-	}
-	cbor_decode_print("val: %u\r\n", *(uint32_t *)p_result);
 	return true;
 }
 
 
-bool uintx32_decode(cbor_decode_state_t * p_state,
-		uint32_t *p_result, void *p_min_value, void *p_max_value)
+bool uintx32_decode(cbor_state_t * p_state, uint32_t *p_result)
 {
 	uint8_t major_type = MAJOR_TYPE(*p_state->p_payload);
 
@@ -208,116 +187,263 @@ bool uintx32_decode(cbor_decode_state_t * p_state,
 		/* Value to be read doesn't have the right type. */
 		FAIL();
 	}
-	if (!uint32_decode(p_state, p_result, p_min_value, p_max_value)){
+	if (!uint32_decode(p_state, p_result)){
+		FAIL();
+	}
+	return true;
+}
+
+bool uintx32_expect(cbor_state_t * p_state, uint32_t *p_result)
+{
+	uint32_t value;
+	if (!uintx32_decode(p_state, &value)) {
+		FAIL();
+	}
+	if (value != *p_result) {
+		cbor_print("%u != %u\r\n", value, *p_result);
 		FAIL();
 	}
 	return true;
 }
 
 
-static bool size_decode(cbor_decode_state_t * p_state,
-		size_t *p_result, size_t *p_min_value, size_t *p_max_value)
-{
-	_Static_assert((sizeof(size_t) == sizeof(uint32_t)),
-			"This code needs size_t to be 4 bytes long.");
-	return uint32_decode(p_state,
-			p_result, p_min_value, p_max_value);
-}
-
-
-bool strx_start_decode(cbor_decode_state_t * p_state,
-		cbor_string_type_t *p_result, void *p_min_len, void *p_max_len)
+static bool strx_start_decode(cbor_state_t * p_state,
+		cbor_string_type_t *p_result, cbor_major_type_t exp_major_type)
 {
 	uint8_t major_type = MAJOR_TYPE(*p_state->p_payload);
-	cbor_string_type_t *p_str_result = (cbor_string_type_t *)p_result;
 
-	if (major_type != CBOR_MAJOR_TYPE_BSTR
-		&& major_type != CBOR_MAJOR_TYPE_TSTR) {
-		/* Value to be read doesn't have the right type. */
+	if (major_type != exp_major_type) {
 		FAIL();
 	}
-	if (!size_decode(p_state,
-			&p_str_result->len, (size_t *)p_min_len,
-			(size_t *)p_max_len)) {
+
+	_Static_assert((sizeof(size_t) == sizeof(uint32_t)),
+			"This code needs size_t to be 4 bytes long.");
+	if (!uint32_decode(p_state, &p_result->len)) {
 		FAIL();
 	}
-	p_str_result->value = p_state->p_payload;
+
+	if ((p_state->p_payload + p_result->len) > p_state->p_payload_end) {
+		cbor_print("error: 0x%x > 0x%x\r\n",
+		(uint32_t)(p_state->p_payload + p_result->len),
+		(uint32_t)p_state->p_payload_end);
+		FAIL();
+	}
+
+	p_result->value = p_state->p_payload;
+	return true;
+}
+
+bool bstrx_cbor_start_decode(cbor_state_t *p_state)
+{
+	cbor_string_type_t value;
+
+	if(!strx_start_decode(p_state, &value, CBOR_MAJOR_TYPE_BSTR)) {
+		FAIL();
+	}
+
+	if (!new_backup(p_state, 0xFFFFFFFF)) {
+		FAIL();
+	}
+
+	p_state->p_payload_end = value.value + value.len;
+	return true;
+}
+
+bool bstrx_cbor_end_decode(cbor_state_t *p_state)
+{
+	if (p_state->p_payload != p_state->p_payload_end) {
+		FAIL();
+	}
+	if (!restore_backup(p_state,
+			FLAG_RESTORE | FLAG_DISCARD | FLAG_TRANSFER_PAYLOAD,
+			0xFFFFFFFF)) {
+		FAIL();
+	}
+
 	return true;
 }
 
 
-bool strx_decode(cbor_decode_state_t * p_state,
-		cbor_string_type_t *p_result, void *p_min_len, void *p_max_len)
+bool strx_decode(cbor_state_t * p_state, cbor_string_type_t *p_result,
+		cbor_major_type_t exp_major_type)
 {
-	if (!strx_start_decode(p_state, p_result,
-				p_min_len, p_max_len)) {
-		return false;
+	if (!strx_start_decode(p_state, p_result, exp_major_type)) {
+		FAIL();
 	}
+
 	(p_state->p_payload) += p_result->len;
 	return true;
 }
 
 
-bool list_start_decode(cbor_decode_state_t * p_state,
-		size_t *p_result, size_t min_num, size_t max_num)
+bool strx_expect(cbor_state_t *p_state, cbor_string_type_t *p_result,
+		cbor_major_type_t exp_major_type)
 {
-	uint8_t major_type = MAJOR_TYPE(*p_state->p_payload);
-
-	*p_result = p_state->elem_count;
-
-	if (major_type != CBOR_MAJOR_TYPE_LIST
-		&& major_type != CBOR_MAJOR_TYPE_MAP) {
+	cbor_string_type_t result;
+	if (!strx_decode(p_state, &result, exp_major_type)) {
 		FAIL();
 	}
-	if (!uint32_decode(p_state,
-			p_result, &min_num, &max_num)) {
+	if ((result.len != p_result->len)
+			|| memcmp(p_result->value, result.value, result.len)) {
 		FAIL();
 	}
-	size_t tmp = *p_result;
-	*p_result = p_state->elem_count;
-	p_state->elem_count = major_type == CBOR_MAJOR_TYPE_MAP ? tmp * 2 : tmp;
 	return true;
 }
 
 
-bool primx_decode(cbor_decode_state_t * p_state,
-		uint8_t *p_result, void *p_min_result, void *p_max_result)
+bool bstrx_decode(cbor_state_t * p_state, cbor_string_type_t *p_result)
+{
+	return strx_decode(p_state, p_result, CBOR_MAJOR_TYPE_BSTR);
+}
+
+
+bool bstrx_expect(cbor_state_t * p_state, cbor_string_type_t *p_result)
+{
+	return strx_expect(p_state, p_result, CBOR_MAJOR_TYPE_BSTR);
+}
+
+
+bool tstrx_decode(cbor_state_t * p_state, cbor_string_type_t *p_result)
+{
+	return strx_decode(p_state, p_result, CBOR_MAJOR_TYPE_TSTR);
+}
+
+
+bool tstrx_expect(cbor_state_t * p_state, cbor_string_type_t *p_result)
+{
+	return strx_expect(p_state, p_result, CBOR_MAJOR_TYPE_TSTR);
+}
+
+
+static bool list_map_start_decode(cbor_state_t *p_state,
+		cbor_major_type_t exp_major_type)
+{
+	size_t new_elem_count;
+	uint8_t major_type = MAJOR_TYPE(*p_state->p_payload);
+
+	if (major_type != exp_major_type) {
+		FAIL();
+	}
+
+	if (!uint32_decode(p_state, &new_elem_count)) {
+		FAIL();
+	}
+
+	if (!new_backup(p_state, new_elem_count)) {
+		FAIL();
+	}
+
+	return true;
+}
+
+
+bool list_start_decode(cbor_state_t *p_state)
+{
+	return list_map_start_decode(p_state, CBOR_MAJOR_TYPE_LIST);
+}
+
+
+bool map_start_decode(cbor_state_t *p_state)
+{
+	bool ret = list_map_start_decode(p_state, CBOR_MAJOR_TYPE_MAP);
+	if (ret) {
+		p_state->elem_count *= 2;
+	}
+	return ret;
+}
+
+
+bool list_map_end_decode(cbor_state_t *p_state)
+{
+	if (!restore_backup(p_state,
+			FLAG_RESTORE | FLAG_DISCARD | FLAG_TRANSFER_PAYLOAD,
+			0)) {
+		FAIL();
+	}
+
+	return true;
+}
+
+
+bool list_end_decode(cbor_state_t *p_state)
+{
+	return list_map_end_decode(p_state);
+}
+
+
+bool map_end_decode(cbor_state_t *p_state)
+{
+	return list_map_end_decode(p_state);
+}
+
+
+static bool primx_decode(cbor_state_t * p_state, uint32_t *p_result)
 {
 	uint8_t major_type = MAJOR_TYPE(*p_state->p_payload);
-	uint32_t val;
 
 	if (major_type != CBOR_MAJOR_TYPE_PRIM) {
 		/* Value to be read doesn't have the right type. */
 		FAIL();
 	}
-	if (!uint32_decode(p_state,
-			&val, p_min_result, p_max_result)) {
+	if (!uint32_decode(p_state, p_result)) {
 		FAIL();
 	}
-	if (p_result != NULL) {
-		*p_result = val;
+	if (*p_result > 0xFF) {
+		FAIL();
 	}
 	return true;
 }
 
-
-bool boolx_decode(cbor_decode_state_t * p_state,
-		bool *p_result, void *p_min_result, void *p_max_result)
+static bool primx_expect(cbor_state_t * p_state, uint32_t result)
 {
-	uint8_t min_result = *(uint8_t *)p_min_result + BOOL_TO_PRIM;
-	uint8_t max_result = *(uint8_t *)p_max_result + BOOL_TO_PRIM;
-
-	if (!primx_decode(p_state,
-			(uint8_t *)p_result, &min_result, &max_result)) {
+	uint32_t value;
+	if (!primx_decode(p_state, &value)){
 		FAIL();
 	}
-	(*p_result) -= BOOL_TO_PRIM;
+	if (value != result) {
+		FAIL();
+	}
 	return true;
 }
 
 
-bool double_decode(cbor_decode_state_t * p_state,
-		double *p_result, void *p_min_result, void *p_max_result)
+bool nilx_expect(cbor_state_t *p_state, void *p_result)
+{
+	if (!primx_expect(p_state, 22)) {
+		FAIL();
+	}
+	return true;
+}
+
+
+bool boolx_decode(cbor_state_t * p_state, bool *p_result)
+{
+	uint32_t result;
+
+	if (!primx_decode(p_state, &result)) {
+		FAIL();
+	}
+	(*p_result) = result - BOOL_TO_PRIM;
+
+	cbor_print("boolval: %u\r\n", *p_result);
+	return true;
+}
+
+
+bool boolx_expect(cbor_state_t * p_state, bool *p_result)
+{
+	bool value;
+	if (!boolx_decode(p_state, &value)) {
+		FAIL();
+	}
+	if (value != *p_result) {
+		FAIL();
+	}
+	return true;
+}
+
+
+bool double_decode(cbor_state_t * p_state, double *p_result)
 {
 	uint8_t major_type = MAJOR_TYPE(*p_state->p_payload);
 
@@ -329,18 +455,26 @@ bool double_decode(cbor_decode_state_t * p_state,
 			sizeof(*p_result))) {
 		FAIL();
 	}
+	return true;
+}
 
-	if (!PTR_VALUE_IN_RANGE(double, p_result, p_min_result, p_max_result)) {
+
+bool double_expect(cbor_state_t * p_state, double *p_result)
+{
+	double value;
+	if (!double_decode(p_state, &value)) {
+		FAIL();
+	}
+	if (value != *p_result) {
 		FAIL();
 	}
 	return true;
 }
 
 
-bool any_decode(cbor_decode_state_t * p_state,
-		void *p_result, void *p_min_result, void *p_max_result)
+bool any_decode(cbor_state_t * p_state, void *p_result)
 {
-	cbor_decode_assert(p_result == NULL,
+	cbor_assert(p_result == NULL,
 			"'any' type cannot be returned, only skipped.\n");
 
 	uint8_t major_type = MAJOR_TYPE(*p_state->p_payload);
@@ -365,9 +499,9 @@ bool any_decode(cbor_decode_state_t * p_state,
 		case CBOR_MAJOR_TYPE_LIST:
 			temp_elem_count = p_state->elem_count;
 			p_state->elem_count = value;
-			if (!multi_decode(value, value, &num_decode, any_decode,
-					p_state,
-					&p_null_result,	NULL, NULL, 0)) {
+			if (!multi_decode(value, value, &num_decode,
+					(void *)any_decode, p_state,
+					&p_null_result,	0)) {
 				p_state->elem_count = temp_elem_count;
 				FAIL();
 			}
@@ -385,11 +519,9 @@ bool any_decode(cbor_decode_state_t * p_state,
 bool multi_decode(size_t min_decode,
 		size_t max_decode,
 		size_t *p_num_decode,
-		decoder_t decoder,
-		cbor_decode_state_t * p_state,
+		cbor_decoder_t decoder,
+		cbor_state_t * p_state,
 		void *p_result,
-		void *p_min_result,
-		void *p_max_result,
 		size_t result_len)
 {
 	for (size_t i = 0; i < max_decode; i++) {
@@ -397,21 +529,33 @@ bool multi_decode(size_t min_decode,
 		size_t elem_count_bak = p_state->elem_count;
 
 		if (!decoder(p_state,
-				(uint8_t *)p_result + i*result_len,
-				p_min_result,
-				p_max_result)) {
+				(uint8_t *)p_result + i*result_len)) {
 			*p_num_decode = i;
 			p_state->p_payload = p_payload_bak;
 			p_state->elem_count = elem_count_bak;
 			if (i < min_decode) {
 				FAIL();
 			} else {
-				cbor_decode_print("Found %zu elements.\n", i);
+				cbor_print("Found %zu elements.\n", i);
 			}
 			return true;
 		}
 	}
-	cbor_decode_print("Found %zu elements.\n", max_decode);
+	cbor_print("Found %zu elements.\n", max_decode);
 	*p_num_decode = max_decode;
 	return true;
+}
+
+
+bool present_decode(size_t *p_present,
+		cbor_decoder_t decoder,
+		cbor_state_t * p_state,
+		void *p_result)
+{
+	size_t num_decode;
+	bool retval = multi_decode(0, 1, &num_decode, decoder, p_state, p_result, 0);
+	if (retval) {
+		*p_present = num_decode;
+	}
+	return retval;
 }
